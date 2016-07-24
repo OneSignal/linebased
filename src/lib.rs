@@ -1,4 +1,6 @@
 extern crate mio;
+#[macro_use]
+extern crate log;
 
 use std::str;
 use std::ops;
@@ -13,6 +15,11 @@ use mio::TryRead;
 use mio::TryWrite;
 
 const NEWLINE: u8 = 0x0a;
+
+mod error;
+
+pub use error::Result;
+pub use error::Error;
 
 /// Possible states a client is in
 enum ClientState {
@@ -71,12 +78,12 @@ impl Client {
     }
 
     #[inline]
-    pub fn reregister(&mut self, event_loop: &mut EventLoop<CommandServer>) {
+    pub fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
         let opt = PollOpt::edge() | PollOpt::oneshot();
-        event_loop.reregister(&self.socket, self.token, self.interest(), opt).unwrap();
+        event_loop.reregister(&self.socket, self.token, self.interest(), opt)
     }
 
-    pub fn write(&mut self, event_loop: &mut EventLoop<CommandServer>) -> Status {
+    pub fn write(&mut self, _event_loop: &mut EventLoop<Server>) -> Status {
         let mut done = false;
         match self.state {
             ClientState::Responding(ref mut buf) => {
@@ -90,7 +97,7 @@ impl Client {
                         }
                     },
                     Err(err) => {
-                        println!("error trying to write: {:?}", err);
+                        debug!("error writing to client; disconnecting. {}", err);
                         return Status::Disconnected
                     }
                 }
@@ -105,7 +112,7 @@ impl Client {
         Status::Ok
     }
 
-    pub fn read<F>(&mut self, event_loop: &mut EventLoop<CommandServer>, func: &F) -> Status
+    pub fn read<F>(&mut self, _event_loop: &mut EventLoop<Server>, func: &F) -> Status
         where F: Fn(Query) -> String
     {
         match self.socket.try_read(&mut self.buf[self.pos..]) {
@@ -140,7 +147,7 @@ impl Client {
                                     response.push(' ' as u8);
                                     self.state = ClientState::Responding(io::Cursor::new(response));
                                 },
-                                Err(err) => println!("command is invalid utf8"),
+                                Err(_) => debug!("command is invalid utf8"),
                             }
                         }
 
@@ -157,16 +164,18 @@ impl Client {
                     // off-by-1 error mentioned above can be handled by dealing
                     // with this first.
                 }
+
+                Status::Ok
             },
             Ok(None) => {
-                // pass
+                Status::Ok
             },
             Err(err) => {
-                panic!("error trying to read: {:?}", err);
+                debug!("error reading from client; disconnecting: {}", err);
+                return Status::Disconnected
             }
         }
 
-        Status::Ok
     }
 }
 
@@ -181,13 +190,13 @@ fn find_in_slice<T: PartialEq>(slice: &[T], target: T) -> Option<usize> {
     None
 }
 
-struct CommandServer {
+pub struct Server {
     server: TcpListener,
     clients: Slab<Client>,
     handler: Box<Fn(Query) -> String>,
 }
 
-struct Query<'a>(&'a str);
+pub struct Query<'a>(&'a str);
 
 impl<'a> ops::Deref for Query<'a> {
     type Target = str;
@@ -202,70 +211,83 @@ impl<'a> fmt::Display for Query<'a> {
     }
 }
 
-impl CommandServer {
+impl Server {
     /// Create a new server
     ///
     /// TODO config, handler Fn, error handling, reduce 'static requirement on F
-    pub fn new<F>(func: F) -> CommandServer
+    pub fn new<F>(func: F) -> Result<Server>
         where F: Fn(Query) -> String + 'static
     {
-        let address = "0.0.0.0:7343".parse().unwrap();
-        let server = TcpListener::bind(&address).unwrap();
+        let address = try!("0.0.0.0:7343".parse());
+        let server = try!(TcpListener::bind(&address));
 
         // 1024 possible clients; TODO config
         let slab = Slab::new_starting_at(mio::Token(1), 1024);
 
-        CommandServer {
+        Ok(Server {
             server: server,
             clients: slab,
             handler: Box::new(func),
-        }
+        })
     }
 
     /// Run the server on current thread
     ///
     /// This call blocks while the server runs
-    pub fn run(&mut self) {
-        let mut event_loop = EventLoop::new().unwrap();
-        event_loop.register(&self.server, SERVER_TOKEN, EventSet::readable(), PollOpt::level());
+    pub fn run(&mut self) -> io::Result<()> {
+        let mut event_loop = try!(EventLoop::new());
+        try!(event_loop.register(&self.server,
+                                 SERVER_TOKEN,
+                                 EventSet::readable(),
+                                 PollOpt::level()));
 
-        println!("Running server");
-        event_loop.run(self);
+        info!("server running");
+        try!(event_loop.run(self));
+
+        Ok(())
     }
 }
 
-impl mio::Handler for CommandServer {
+impl mio::Handler for Server {
     type Timeout = ();
     type Message = (); // Will eventually be for returning responses
 
-    fn ready(&mut self, event_loop: &mut EventLoop<CommandServer>, token: Token, events: EventSet) {
+    fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
         match token {
             SERVER_TOKEN => {
                 // Only receive readable events
                 assert!(events.is_readable());
 
-                println!("the server socket is ready to accept a connection");
+                debug!("accepting connection");
                 match self.server.accept() {
                     Ok(Some((socket, _addr))) => {
-                        println!("new client");
-                        let token = self.clients
+                        let token = match self.clients
                             .insert_with(|token| Client::new(socket, token))
-                            .unwrap();
+                        {
+                            Some(token) => token,
+                            None => {
+                                info!("rejecting client; max connections reached");
+                                return;
+                            }
+                        };
 
-                        let client = &self.clients[token];
-
-                        event_loop.register(&client.socket,
-                                            token,
-                                            client.interest(),
-                                            PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                    }
+                        let opt = PollOpt::edge() | PollOpt::oneshot();
+                        if let Err(err) = event_loop.register(&self.clients[token].socket,
+                                                              token,
+                                                              self.clients[token].interest(),
+                                                              opt)
+                        {
+                            warn!("Couldn't register new client; {}", err);
+                            self.clients.remove(token);
+                        }
+                    },
                     Ok(None) => {
-                        println!("the server socket wasn't actually ready");
-                    }
-                    Err(e) => {
-                        println!("listener.accept() errored: {}", e);
+                        // pass
+                    },
+                    Err(err) => {
+                        error!("listener.accept() error; {}", err);
                         event_loop.shutdown();
-                    }
+                    },
                 }
             }
 
@@ -284,11 +306,14 @@ impl mio::Handler for CommandServer {
 
                 match status {
                     Status::Disconnected => {
-                        println!("Removing client: {:?}", token);
+                        trace!("closing client connection");
                         self.clients.remove(token);
                     },
                     Status::Ok => {
-                        self.clients[token].reregister(event_loop);
+                        if let Err(err) = self.clients[token].reregister(event_loop) {
+                            warn!("Failed to reregister client interest; {}", err);
+                            self.clients.remove(token);
+                        }
                     },
                 }
             },
@@ -297,20 +322,6 @@ impl mio::Handler for CommandServer {
 }
 
 const SERVER_TOKEN: Token = Token(0);
-
-pub fn run() {
-    let mut server = CommandServer::new(|query| {
-        match &*query {
-            "version" => {
-                String::from("0.1.0")
-            },
-            _ => {
-                String::from("unknown command")
-            }
-        }
-    });
-    server.run();
-}
 
 #[cfg(test)]
 mod tests {

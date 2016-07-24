@@ -5,3 +5,4 @@ authors = ["Joe Wilm <joe@jwilm.com>"]
 
 [dependencies]
 mio = "0.5"
+log = "0.3"

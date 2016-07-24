@@ -19,14 +19,14 @@ Nothing is configurable right now, but that will be changing shortly. A closure
 is provided to the server at startup. Match on queries and return a response.
 
 ```rust
-let mut server = CommandServer::new(|query| {
+let mut server = Server::new(|query| {
     match query {
         "version" => String::from("0.1.0"),
         _ => String::from("unknown command"),
     }
-});
+}).unwrap();
 
-server.run();
+server.run().unwrap();
 ```
 
 This can be accessed over netcat like so:
