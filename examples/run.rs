@@ -4,7 +4,7 @@ use linebased::Server;
 
 fn main() {
     let mut server = Server::new(|query| {
-        match &*query {
+        match query {
             "version" => {
                 String::from("0.1.0")
             },

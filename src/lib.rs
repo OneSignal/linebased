@@ -3,8 +3,6 @@ extern crate mio;
 extern crate log;
 
 use std::str;
-use std::ops;
-use std::fmt;
 use std::io;
 
 use mio::{EventLoop, Token, EventSet, PollOpt};
@@ -113,7 +111,7 @@ impl Client {
     }
 
     pub fn read<F>(&mut self, _event_loop: &mut EventLoop<Server>, func: &F) -> Status
-        where F: Fn(Query) -> String
+        where F: Fn(&str) -> String
     {
         match self.socket.try_read(&mut self.buf[self.pos..]) {
             Ok(Some(0)) => {
@@ -140,7 +138,7 @@ impl Client {
 
                             match str::from_utf8(command) {
                                 Ok(command) => {
-                                    let response = func(Query(command));
+                                    let response = func(command);
                                     let mut response = response.into_bytes();
                                     response.push(NEWLINE);
                                     response.push('>' as u8);
@@ -193,22 +191,7 @@ fn find_in_slice<T: PartialEq>(slice: &[T], target: T) -> Option<usize> {
 pub struct Server {
     server: TcpListener,
     clients: Slab<Client>,
-    handler: Box<Fn(Query) -> String>,
-}
-
-pub struct Query<'a>(&'a str);
-
-impl<'a> ops::Deref for Query<'a> {
-    type Target = str;
-    fn deref(&self) -> &str {
-        self.0
-    }
-}
-
-impl<'a> fmt::Display for Query<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    handler: Box<Fn(&str) -> String>,
 }
 
 impl Server {
@@ -216,7 +199,7 @@ impl Server {
     ///
     /// TODO config, handler Fn, error handling, reduce 'static requirement on F
     pub fn new<F>(func: F) -> Result<Server>
-        where F: Fn(Query) -> String + 'static
+        where F: Fn(&str) -> String + 'static
     {
         let address = try!("0.0.0.0:7343".parse());
         let server = try!(TcpListener::bind(&address));
