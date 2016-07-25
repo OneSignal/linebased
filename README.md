@@ -39,7 +39,7 @@ server.run().unwrap();
 This can be accessed over netcat like so:
 
 ```
-jwilm@jwilm-desk ➜ nc localhost 7343
+jwilm@jwilm-desk ➜ nc localhost 5555
 Connected
 > arst
 unknown command
