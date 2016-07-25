@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["Error","Error from linebased crate"]],"struct":[["Config","Server configuration"],["Handle","Handle for the server"],["Server","The linebased TCP server"]],"type":[["Result","Results from linebased crate"]]});
