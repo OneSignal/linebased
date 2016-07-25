@@ -1,3 +1,11 @@
+//! Add a TCP query server to your program with ease
+//!
+//! I've found myself wanting a drop-in TCP server for some programs recently.
+//! This crate exposes such a server which uses `mio` to multiplex clients and
+//! runs it in a dedicated thread. Communication with the rest of the program
+//! needs to happen through thread-safe APIs. Come to think of it, forcing the
+//! thread on users is kind of cumbersome. TODO remove thread.
+#![warn(missing_docs)]
 extern crate mio;
 #[macro_use]
 extern crate log;
@@ -236,7 +244,7 @@ fn find_in_slice<T: PartialEq>(slice: &[T], target: T) -> Option<usize> {
     None
 }
 
-/// Configuration for the Server and its Clients
+/// Server configuration
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Client prompt
@@ -319,6 +327,7 @@ impl Default for Config {
     }
 }
 
+/// The linebased TCP server
 pub struct Server {
     server: TcpListener,
     clients: Slab<Client>,
@@ -329,7 +338,24 @@ pub struct Server {
 impl Server {
     /// Create a new server
     ///
-    /// TODO reduce 'static requirement on F
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use linebased::Server;
+    ///
+    /// // Create a server with the default config and a
+    /// // handler that only knows the "version" command
+    /// let mut server = Server::new(Default::default(), |query| {
+    ///     match query {
+    ///         "version" => {
+    ///             String::from("0.1.0")
+    ///         },
+    ///         _ => {
+    ///             String::from("unknown command")
+    ///         }
+    ///     }
+    /// }).unwrap();
+    /// ```
     pub fn new<F>(config: Config, func: F) -> Result<Handle>
         where F: Fn(&str) -> String + 'static + Send
     {
@@ -352,7 +378,7 @@ impl Server {
     /// Run the server on current thread
     ///
     /// This call blocks while the server runs
-    pub fn run(self) -> io::Result<Handle> {
+    fn run(self) -> io::Result<Handle> {
         let mut event_loop = try!(EventLoop::new());
 
         let sender = event_loop.channel();
@@ -374,12 +400,14 @@ impl Server {
     }
 }
 
+/// Handle for server returned from `Server::new()`
 pub struct Handle {
     thread: Option<thread::JoinHandle<()>>,
     sender: ::mio::Sender<ControlMsg>,
 }
 
 impl Handle {
+    /// Shut down the server and join its thread
     pub fn join(&mut self) -> Option<thread::Result<()>> {
         match self.thread.take() {
             Some(handle) => {
@@ -401,6 +429,7 @@ impl Handle {
     }
 }
 
+#[doc(hidden)]
 pub enum ControlMsg {
     /// Stop the event loop
     Shutdown,
@@ -699,7 +728,7 @@ mod tests {
             let mut client = Client::new(&config);
             {
                 // should get disconnected immediately
-                let client = Client::new(&config);
+                let _client = Client::new(&config);
             }
             client.expect("Connected");
             client.send("version");

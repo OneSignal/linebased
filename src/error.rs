@@ -1,9 +1,13 @@
 use std::io;
 use std::net;
 
+/// Error from linebased crate
 #[derive(Debug)]
 pub enum Error {
+    /// Encountered I/O error
     Io(io::Error),
+
+    /// Error parsing listen address
     AddrParse(net::AddrParseError),
 }
 
@@ -44,4 +48,5 @@ impl From<net::AddrParseError> for Error {
     }
 }
 
+/// Results from linebased crate
 pub type Result<T> = ::std::result::Result<T, Error>;
