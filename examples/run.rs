@@ -22,7 +22,6 @@ fn main() {
         }
     }).unwrap();
 
-    ::std::thread::sleep(::std::time::Duration::from_secs(60));
 
-    server.join().unwrap().unwrap();
+    server.run().unwrap();
 }

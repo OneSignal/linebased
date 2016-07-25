@@ -15,6 +15,9 @@ The server uses an event loop internally to multiplex client connections.
 
 ## Usage
 
+This example is kept up-to-date on a best-effort basis. For a guaranteed acurate
+example, please see the docs.
+
 ```rust
 let config = Config::default()
         .host("127.0.0.1")
@@ -31,9 +34,7 @@ let mut server = Server::new(config, |query| {
     }
 }).unwrap();
 
-// server is a `Handle`. Call `join` when you want it to stop. It's running on a
-// thread.
-server.join().unwrap().unwrap();
+server.run().unwrap();
 ```
 
 This can be accessed over netcat like so:

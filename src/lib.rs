@@ -1,10 +1,47 @@
-//! Add a TCP query server to your program with ease
+//! Drop-in TCP command server
 //!
-//! I've found myself wanting a drop-in TCP server for some programs recently.
-//! This crate exposes such a server which uses `mio` to multiplex clients and
-//! runs it in a dedicated thread. Communication with the rest of the program
-//! needs to happen through thread-safe APIs. Come to think of it, forcing the
-//! thread on users is kind of cumbersome. TODO remove thread.
+//! Provide a callback that is passed commands from clients and handle them synchronously.
+//! `mio` is used internally so multiple clients may be active.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use linebased::Server;
+//!
+//! // Create a server with the default config and a
+//! // handler that only knows the "version" command
+//! let mut server = Server::new(Default::default(), |query| {
+//!     match query {
+//!         "version" => String::from("0.1.0"),
+//!         _ => String::from("unknown command"),
+//!     }
+//! }).unwrap();
+//!
+//! server.run().unwrap();
+//! ```
+//!
+//! Running a server from a separate thread is also possible. Request a handle
+//! from the server so that you may shut it down gracefully.
+//!
+//! ```no_run
+//! use linebased::Server;
+//! use std::thread;
+//!
+//! let mut server = Server::new(Default::default(), |query| {
+//!     match query {
+//!         "version" => String::from("0.1.0"),
+//!         _ => String::from("unknown command"),
+//!     }
+//! }).unwrap();
+//!
+//! let handle = server.handle();
+//! let thread = thread::spawn(move || server.run().unwrap());
+//!
+//! // Time passes
+//!
+//! handle.shutdown().unwrap();
+//! thread.join().unwrap();
+//! ```
 #![warn(missing_docs)]
 extern crate mio;
 #[macro_use]
@@ -12,7 +49,6 @@ extern crate log;
 
 use std::str;
 use std::io;
-use std::thread;
 
 use mio::{EventLoop, Token, EventSet, PollOpt};
 use mio::tcp::TcpListener;
@@ -21,12 +57,13 @@ use mio::util::Slab;
 use mio::TryRead;
 use mio::TryWrite;
 
-const NEWLINE: u8 = 0x0a;
-
 mod error;
 
 pub use error::Result;
 pub use error::Error;
+
+const NEWLINE: u8 = 0x0a;
+const SERVER_TOKEN: Token = Token(0);
 
 /// Possible states a client is in
 enum ClientState {
@@ -91,12 +128,12 @@ impl Client {
     }
 
     #[inline]
-    pub fn reregister(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    pub fn reregister(&mut self, event_loop: &mut EventLoop<ServerInner>) -> io::Result<()> {
         let opt = PollOpt::edge() | PollOpt::oneshot();
         event_loop.reregister(&self.socket, self.token, self.interest(), opt)
     }
 
-    pub fn write(&mut self, _event_loop: &mut EventLoop<Server>) -> Status {
+    pub fn write(&mut self, _event_loop: &mut EventLoop<ServerInner>) -> Status {
         let mut done = false;
         match self.state {
             ClientState::Responding(ref mut buf) => {
@@ -184,7 +221,7 @@ impl Client {
     }
 
     pub fn read<F>(&mut self,
-                   _event_loop: &mut EventLoop<Server>,
+                   _event_loop: &mut EventLoop<ServerInner>,
                    func: &F,
                    config: &Config)
                    -> Status
@@ -327,12 +364,30 @@ impl Default for Config {
     }
 }
 
+/// Handle for the server
+pub struct Handle {
+    sender: mio::Sender<ControlMsg>,
+}
+
+impl Handle {
+    /// Request the server to shutdown gracefully
+    pub fn shutdown(&self) -> io::Result<()> {
+        while let Err(err) = self.sender.send(ControlMsg::Shutdown) {
+            match err {
+                mio::NotifyError::Full(_) => continue,
+                mio::NotifyError::Closed(_) => break,
+                mio::NotifyError::Io(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// The linebased TCP server
 pub struct Server {
-    server: TcpListener,
-    clients: Slab<Client>,
-    handler: Box<Fn(&str) -> String + Send>,
-    config: Config,
+    inner: ServerInner,
+    event_loop: EventLoop<ServerInner>,
 }
 
 impl Server {
@@ -356,7 +411,57 @@ impl Server {
     ///     }
     /// }).unwrap();
     /// ```
-    pub fn new<F>(config: Config, func: F) -> Result<Handle>
+    pub fn new<F>(config: Config, func: F) -> Result<Server>
+        where F: Fn(&str) -> String + 'static + Send
+    {
+        let inner = try!(ServerInner::new(config, func));
+        let event_loop = try!(EventLoop::new());
+
+        Ok(Server {
+            inner: inner,
+            event_loop: event_loop
+        })
+    }
+
+    /// Get a handle for the server so graceful shutdown can be requested
+    pub fn handle(&self) -> Handle {
+        Handle {
+            sender: self.event_loop.channel()
+        }
+    }
+
+    /// Run the event loop
+    ///
+    /// Blocks until a graceful shutdown is initiated or an unrecoverable error
+    /// occurs.
+    pub fn run(&mut self) -> io::Result<()> {
+        let event_loop = &mut self.event_loop;
+        let server = &mut self.inner;
+
+        try!(event_loop.register(&server.server,
+                                 SERVER_TOKEN,
+                                 EventSet::readable(),
+                                 PollOpt::level()));
+        try!(event_loop.run(server));
+
+        Ok(())
+    }
+}
+
+/// mio::Handler implementation
+///
+/// Can't implement mio::Handler for `Server` itself since that holds the
+/// `EventLoop`.
+struct ServerInner {
+    server: TcpListener,
+    clients: Slab<Client>,
+    handler: Box<Fn(&str) -> String + Send>,
+    config: Config,
+}
+
+impl ServerInner {
+    /// Create new ServerInner
+    pub fn new<F>(config: Config, func: F) -> Result<ServerInner>
         where F: Fn(&str) -> String + 'static + Send
     {
         let address = try!(format!("{host}:{port}", host=config.host, port=config.port).parse());
@@ -364,68 +469,12 @@ impl Server {
 
         let slab = Slab::new_starting_at(mio::Token(1), config.max_clients);
 
-        let server = Server {
+        Ok(ServerInner {
             server: server,
             clients: slab,
             handler: Box::new(func),
             config: config,
-        };
-
-        let handle = try!(server.run());
-        Ok(handle)
-    }
-
-    /// Run the server on current thread
-    ///
-    /// This call blocks while the server runs
-    fn run(self) -> io::Result<Handle> {
-        let mut event_loop = try!(EventLoop::new());
-
-        let sender = event_loop.channel();
-        let mut server = self;
-
-        let thread = ::std::thread::spawn(move || {
-            event_loop.register(&server.server,
-                                SERVER_TOKEN,
-                                EventSet::readable(),
-                                PollOpt::level()).expect("server accepting");
-            info!("server running");
-            event_loop.run(&mut server).expect("event loop ok");
-        });
-
-        Ok(Handle {
-            thread: Some(thread),
-            sender: sender,
         })
-    }
-}
-
-/// Handle for server returned from `Server::new()`
-pub struct Handle {
-    thread: Option<thread::JoinHandle<()>>,
-    sender: ::mio::Sender<ControlMsg>,
-}
-
-impl Handle {
-    /// Shut down the server and join its thread
-    pub fn join(&mut self) -> Option<thread::Result<()>> {
-        match self.thread.take() {
-            Some(handle) => {
-                while let Err(err) = self.sender.send(ControlMsg::Shutdown) {
-                    match err {
-                        mio::NotifyError::Full(_) => continue,
-                        mio::NotifyError::Closed(_) => break,
-                        mio::NotifyError::Io(err) => {
-                            // Not sure what to do here. Join will probably block indefinitely.
-                            warn!("cannot send shutdown message; {}", err);
-                            break;
-                        },
-                    }
-                }
-                Some(handle.join())
-            },
-            None => None,
-        }
     }
 }
 
@@ -443,11 +492,11 @@ fn accept(clients: &mut Slab<Client>, config: &Config, socket: TcpStream) -> Opt
     clients.insert_with(|token| Client::new(socket, token, config))
 }
 
-impl mio::Handler for Server {
+impl mio::Handler for ServerInner {
     type Timeout = ();
     type Message = ControlMsg;
 
-    fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
+    fn ready(&mut self, event_loop: &mut EventLoop<ServerInner>, token: Token, events: EventSet) {
         match token {
             SERVER_TOKEN => {
                 debug!("accepting connection");
@@ -517,12 +566,12 @@ impl mio::Handler for Server {
     }
 }
 
-const SERVER_TOKEN: Token = Token(0);
-
 #[cfg(test)]
 mod tests {
-    use super::{Config, Server, find_in_slice, NEWLINE, Handle};
     use std::net::TcpStream;
+    use std::thread;
+
+    use super::{Config, Server, find_in_slice, NEWLINE, Handle};
 
     trait AsByteSlice {
         fn as_byte_slice(&self) -> &[u8];
@@ -630,10 +679,10 @@ mod tests {
         }
     }
 
-    fn run_server(config: &Config) -> Handle {
+    fn run_server(config: &Config) -> TestHandle {
         let config = config.to_owned();
 
-        Server::new(config, |query| {
+        let mut server = Server::new(config, |query| {
             match query {
                 "version" => {
                     String::from("0.1.0")
@@ -642,14 +691,42 @@ mod tests {
                     String::from("unknown command")
                 }
             }
-        }).expect("create server ok")
+        }).unwrap();
+
+        let command_handle = server.handle();
+
+        let thread_handle = ::std::thread::spawn(move || {
+            server.run().unwrap();
+        });
+
+        TestHandle {
+            thread: Some(thread_handle),
+            handle: command_handle,
+        }
+    }
+
+    /// Handle wrapping test server
+    ///
+    /// Requests graceful shutdown and joins with thread on drop
+    pub struct TestHandle {
+        thread: Option<thread::JoinHandle<()>>,
+        handle: Handle,
+    }
+
+    impl Drop for TestHandle {
+        fn drop(&mut self) {
+            let _ = self.handle.shutdown();
+            if let Some(handle) = self.thread.take() {
+                handle.join().unwrap();
+            }
+        }
     }
 
 
     #[test]
     fn it_works() {
         let config = Config::default();
-        let mut server = run_server(&config);
+        let _server = run_server(&config);
 
         {
             let mut client = Client::new(&config);
@@ -659,14 +736,12 @@ mod tests {
             client.send("nope");
             client.expect("> unknown command");
         }
-
-        server.join().unwrap().unwrap();
     }
 
     #[test]
     fn client_message_larger_than_read_buf() {
         let config = Config::default().client_buf_size(8).port(5500);
-        let mut server = run_server(&config);
+        let _server = run_server(&config);
 
         {
             let mut client = Client::new(&config);
@@ -678,14 +753,12 @@ mod tests {
             client.send("version");
             client.expect("> 0.1.0");
         }
-
-        server.join().unwrap().unwrap();
     }
 
     #[test]
     fn send_empty_line() {
         let config = Config::default().port(5501);
-        let mut server = run_server(&config);
+        let _server = run_server(&config);
 
         {
             let mut client = Client::new(&config);
@@ -696,14 +769,12 @@ mod tests {
             client.send("version");
             client.expect("> 0.1.0");
         }
-
-        server.join().unwrap().unwrap();
     }
 
     #[test]
     fn multiple_commands_received_at_once() {
         let config = Config::default().port(5502);
-        let mut server = run_server(&config);
+        let _server = run_server(&config);
 
         {
             let mut client = Client::new(&config);
@@ -715,14 +786,12 @@ mod tests {
             let got = client.recv().unwrap();
             assert!(got.contains("0.1.0"));
         }
-
-        server.join().unwrap().unwrap();
     }
 
     #[test]
     fn exceed_max_clients() {
         let config = Config::default().max_clients(1).port(5503);
-        let mut server = run_server(&config);
+        let _server = run_server(&config);
 
         {
             let mut client = Client::new(&config);
@@ -734,7 +803,5 @@ mod tests {
             client.send("version");
             client.expect("> 0.1.0");
         }
-
-        server.join().unwrap().unwrap();
     }
 }
