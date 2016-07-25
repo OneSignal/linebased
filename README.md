@@ -2,7 +2,7 @@ linebased
 =========
 
 [![Build Status](https://travis-ci.org/jwilm/linebased.svg?branch=master)](https://travis-ci.org/jwilm/linebased)
-[![Crates.io](https://img.shields.io/crates/v/linebased.svg?maxAge=2592000)](https://crates.io/crates/linebased)
+[![Crates.io](https://img.shields.io/crates/v/linebased.svg)](https://crates.io/crates/linebased)
 
 Drop-in TCP command server
 
