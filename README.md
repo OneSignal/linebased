@@ -2,10 +2,9 @@ linebased
 =========
 
 [![Build Status](https://travis-ci.org/jwilm/linebased.svg?branch=master)](https://travis-ci.org/jwilm/linebased)
-[![Crates.io](https://img.shields.io/crates/v/linebased.svg?maxAge=2592000)]()
+[![Crates.io](https://img.shields.io/crates/v/linebased.svg?maxAge=2592000)](https://crates.io/crates/linebased)
 
-Line based TCP server
-
+Drop-in TCP command server
 
 ## About
 
@@ -16,7 +15,7 @@ The server uses an event loop internally to multiplex client connections.
 ## Usage
 
 This example is kept up-to-date on a best-effort basis. For a guaranteed acurate
-example, please see the docs.
+example, please see the [docs].
 
 ```rust
 let config = Config::default()
@@ -24,8 +23,8 @@ let config = Config::default()
         .port(5555)
         .max_clients(32)
         .client_buf_size(1024)
-        .welcome_message("Welcome to the jungle")
-        .prompt(">>> ");
+        .welcome_message("Connected")
+        .prompt("> ");
 
 let mut server = Server::new(config, |query| {
     match query {
@@ -47,3 +46,5 @@ unknown command
 > version
 0.1.0
 ```
+
+[docs]: http://blog.jwilm.io/linebased/linebased/index.html
