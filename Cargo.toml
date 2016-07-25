@@ -2,6 +2,10 @@
 name = "linebased"
 version = "0.1.0"
 authors = ["Joe Wilm <joe@jwilm.com>"]
+license = "MIT OR Apache-2.0"
+description = "Add a TCP query port to any program"
+repository = "https://github.com/jwilm/linebased"
+keywords = ["tcp", "server", "command", "query"]
 
 [dependencies]
 mio = "0.5"
