@@ -2,6 +2,7 @@ linebased
 =========
 
 [![Build Status](https://travis-ci.org/jwilm/linebased.svg?branch=master)](https://travis-ci.org/jwilm/linebased)
+[![Crates.io](https://img.shields.io/crates/v/linebased.svg?maxAge=2592000)]()
 
 Line based TCP server
 
