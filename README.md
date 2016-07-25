@@ -1,7 +1,10 @@
 linebased
 =========
 
+[![Build Status](https://travis-ci.org/jwilm/linebased.svg?branch=master)](https://travis-ci.org/jwilm/linebased)
+
 Line based TCP server
+
 
 ## About
 
