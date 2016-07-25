@@ -634,12 +634,6 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
-    // TODO Wishlist of tests
-    // - send message longer than client read buf; unsupported command should be returned in lengths
-    //   of read buf
-    // - server keeps working when more than max clients try to connect
-    // - empty newline command
-
     #[test]
     fn client_message_larger_than_read_buf() {
         let config = Config::default().client_buf_size(8).port(5500);
