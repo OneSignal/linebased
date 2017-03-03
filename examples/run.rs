@@ -7,9 +7,7 @@ fn main() {
         .host("127.0.0.1")
         .port(5555)
         .max_clients(32)
-        .client_buf_size(24)
-        .welcome_message("Welcome to the jungle")
-        .prompt(">>> ");
+        .client_buf_size(24);
 
     let mut server = Server::new(config, |query| {
         match query {

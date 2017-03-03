@@ -105,16 +105,10 @@ enum Status {
 
 impl Client {
     pub fn new(stream: TcpStream, token: Token, config: &Config) -> Client {
-        // Build initial connect response. It's the welcome message, a newline, and the prompt.
-        let mut message = Vec::new();
-        message.extend_from_slice(config.welcome_message.as_bytes());
-        message.push(NEWLINE);
-        message.extend_from_slice(config.prompt.as_bytes());
-
         Client {
             token: token,
             socket: stream,
-            state: ClientState::Responding(io::Cursor::new(message)),
+            state: ClientState::Await,
             buf: vec![0u8; config.client_buf_size],
             pos: 0,
         }
@@ -180,7 +174,7 @@ impl Client {
         self.pos -= count;
     }
 
-    pub fn try_respond<F>(&mut self, func: &F, config: &Config)
+    pub fn try_respond<F>(&mut self, func: &F)
         where F: Fn(&str) -> String
     {
         let mut response_buf = Vec::new();
@@ -215,15 +209,13 @@ impl Client {
         }
 
         if !response_buf.is_empty() {
-            response_buf.extend_from_slice(config.prompt.as_bytes());
             self.state = ClientState::Responding(io::Cursor::new(response_buf));
         }
     }
 
     pub fn read<F>(&mut self,
                    _event_loop: &mut EventLoop<ServerInner>,
-                   func: &F,
-                   config: &Config)
+                   func: &F)
                    -> Status
         where F: Fn(&str) -> String
     {
@@ -235,7 +227,7 @@ impl Client {
             Ok(Some(bytes_read)) => {
                 self.pos += bytes_read;
 
-                self.try_respond(func, config);
+                self.try_respond(func);
 
                 // Handle full buffer; just try and handle the command
                 if self.pos == self.buf.len() {
@@ -244,7 +236,6 @@ impl Client {
                             let response = func(command);
                             let mut response = response.into_bytes();
                             response.push(NEWLINE);
-                            response.extend_from_slice(config.prompt.as_bytes());
                             self.state = ClientState::Responding(io::Cursor::new(response));
                         },
                         Err(_) => debug!("command is invalid utf8"),
@@ -284,9 +275,6 @@ fn find_in_slice<T: PartialEq>(slice: &[T], target: T) -> Option<usize> {
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Client prompt
-    prompt: String,
-
     /// Address to listen on
     host: String,
 
@@ -300,35 +288,14 @@ pub struct Config {
     ///
     /// This dictates the maximum length of a command.
     client_buf_size: usize,
-
-    /// Welcome message
-    ///
-    /// This message is displayed by clients when they connect.
-    welcome_message: String,
 }
 
 impl Config {
-    /// prompt is displayed to client whenever they may submit a command
-    pub fn prompt<S>(mut self, val: S) -> Self
-        where S: Into<String>
-    {
-        self.prompt = val.into();
-        self
-    }
-
     /// Set host address to listen on
     pub fn host<S>(mut self, val: S) -> Self
         where S: Into<String>
     {
         self.host = val.into();
-        self
-    }
-
-    /// Set welcome message which client receives upon connection
-    pub fn welcome_message<S>(mut self, val: S) -> Self
-        where S: Into<String>
-    {
-        self.welcome_message = val.into();
         self
     }
 
@@ -354,12 +321,10 @@ impl Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            prompt: "> ".into(),
             host: "127.0.0.1".into(),
             port: 7343,
             max_clients: 32,
             client_buf_size: 1024,
-            welcome_message: "Connected".into(),
         }
     }
 }
@@ -392,8 +357,7 @@ pub struct Server {
 
 impl Server {
     /// Create a new server
-    ///
-    /// # Examples
+    // # Examples
     ///
     /// ```no_run
     /// use linebased::Server;
@@ -535,7 +499,7 @@ impl mio::Handler for ServerInner {
                 let status = {
                     let client = &mut self.clients[token];
                     if events.is_readable() {
-                        client.read(event_loop, &&*self.handler, &self.config)
+                        client.read(event_loop, &&*self.handler)
                     } else if events.is_writable() {
                         client.write(event_loop)
                     } else {
@@ -730,11 +694,10 @@ mod tests {
 
         {
             let mut client = Client::new(&config);
-            client.expect("Connected");
             client.send("version");
-            client.expect("> 0.1.0");
+            client.expect("0.1.0");
             client.send("nope");
-            client.expect("> unknown command");
+            client.expect("unknown command");
         }
     }
 
@@ -745,13 +708,12 @@ mod tests {
 
         {
             let mut client = Client::new(&config);
-            client.expect("Connected");
             client.send("123456789"); // send more than buf size of 8
-            client.expect("> unknown command"); // first 8 bytes trigger this response
-            client.expect("> unknown command"); // "9\n" triggers this response
+            client.expect("unknown command"); // first 8 bytes trigger this response
+            client.expect("unknown command"); // "9\n" triggers this response
             // commands should continue to work
             client.send("version");
-            client.expect("> 0.1.0");
+            client.expect("0.1.0");
         }
     }
 
@@ -762,12 +724,11 @@ mod tests {
 
         {
             let mut client = Client::new(&config);
-            client.expect("Connected");
             client.send("");
-            client.expect("> unknown command");
+            client.expect("unknown command");
             // commands should continue to work
             client.send("version");
-            client.expect("> 0.1.0");
+            client.expect("0.1.0");
         }
     }
 
@@ -778,9 +739,7 @@ mod tests {
 
         {
             let mut client = Client::new(&config);
-            client.expect("Connected");
             client.send("version\nversion");
-            client.expect("> 0.1.0");
 
             // This is a bug. Second response may or may not have a prompt.
             let got = client.recv().unwrap();
@@ -799,9 +758,8 @@ mod tests {
                 // should get disconnected immediately
                 let _client = Client::new(&config);
             }
-            client.expect("Connected");
             client.send("version");
-            client.expect("> 0.1.0");
+            client.expect("0.1.0");
         }
     }
 }

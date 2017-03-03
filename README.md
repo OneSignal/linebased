@@ -22,9 +22,7 @@ let config = Config::default()
         .host("127.0.0.1")
         .port(5555)
         .max_clients(32)
-        .client_buf_size(1024)
-        .welcome_message("Connected")
-        .prompt("> ");
+        .client_buf_size(1024);
 
 let mut server = Server::new(config, |query| {
     match query {
@@ -40,10 +38,9 @@ This can be accessed over netcat like so:
 
 ```
 jwilm@jwilm-desk ➜ nc localhost 5555
-Connected
-> arst
+arst
 unknown command
-> version
+version
 0.1.0
 ```
 
