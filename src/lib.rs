@@ -404,7 +404,7 @@ impl Server {
 
         try!(event_loop.register(&server.server,
                                  SERVER_TOKEN,
-                                 EventSet::readable(),
+                                 EventSet::readable() | EventSet::hup(),
                                  PollOpt::level()));
         try!(event_loop.run(server));
 
@@ -502,6 +502,8 @@ impl mio::Handler for ServerInner {
                         client.read(event_loop, &&*self.handler)
                     } else if events.is_writable() {
                         client.write(event_loop)
+                    } if events.is_hup() {
+                        Status::Disconnected
                     } else {
                         Status::Ok
                     }
