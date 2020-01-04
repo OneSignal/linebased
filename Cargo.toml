@@ -7,7 +7,13 @@ description = "Add a TCP query port to any program"
 repository = "https://github.com/jwilm/linebased"
 keywords = ["tcp", "server", "command", "query"]
 documentation = "http://blog.jwilm.io/linebased/linebased/index.html"
+edition = "2018"
 
 [dependencies]
-mio = "0.5"
-log = "0.3"
+tokio = { version = "0.2", features = ["tcp", "sync", "rt-core", "io-util"] }
+log = "0.4"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "0.2", features = ["macros", "tcp", "sync", "rt-core", "io-util"] }
+env_logger = "0.7"
