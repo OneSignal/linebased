@@ -1,5 +1,4 @@
-linebased
-=========
+# linebased
 
 [![Build Status](https://travis-ci.org/jwilm/linebased.svg?branch=master)](https://travis-ci.org/jwilm/linebased)
 [![Crates.io](https://img.shields.io/crates/v/linebased.svg)](https://crates.io/crates/linebased)
@@ -18,20 +17,23 @@ This example is kept up-to-date on a best-effort basis. For a guaranteed acurate
 example, please see the [docs].
 
 ```rust
-let config = Config::default()
+#[tokio::main]
+async fn main() {
+    let config = Config::default()
         .host("127.0.0.1")
         .port(5555)
         .max_clients(32)
         .client_buf_size(1024);
 
-let mut server = Server::new(config, |query| {
-    match query {
-        "version" => String::from("0.1.0"),
-        _ => String::from("unknown command"),
-    }
-}).unwrap();
+    let mut server = Server::new(config, |query| {
+        match query {
+            "version" => String::from("0.1.0"),
+            _ => String::from("unknown command"),
+        }
+    }).unwrap();
 
-server.run().unwrap();
+    server.run().await.unwrap();
+}
 ```
 
 This can be accessed over netcat like so:

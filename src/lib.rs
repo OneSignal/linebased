@@ -1,276 +1,77 @@
+#![recursion_limit = "256"]
 //! Drop-in TCP command server
 //!
 //! Provide a callback that is passed commands from clients and handle them synchronously.
-//! `mio` is used internally so multiple clients may be active.
+//! `tokio` is used internally so multiple clients may be active.
 //!
 //! # Examples
 //!
 //! ```no_run
 //! use linebased::Server;
 //!
-//! // Create a server with the default config and a
-//! // handler that only knows the "version" command
-//! let mut server = Server::new(Default::default(), |query| {
-//!     match query {
-//!         "version" => String::from("0.1.0"),
-//!         _ => String::from("unknown command"),
-//!     }
-//! }).unwrap();
+//! #[tokio::main]
+//! async fn main() {
+//!     // Create a server with the default config and a
+//!     // handler that only knows the "version" command
+//!     let mut server = Server::new(Default::default(), |query| {
+//!         match query {
+//!             "version" => String::from("0.1.0"),
+//!             _ => String::from("unknown command"),
+//!         }
+//!     }).unwrap();
 //!
-//! server.run().unwrap();
+//!     server.run().await.unwrap();
+//! }
 //! ```
 //!
-//! Running a server from a separate thread is also possible. Request a handle
-//! from the server so that you may shut it down gracefully.
+//! Running a server in the background is also possible, just spawn the future
+//! returned by `Server::run`. Request a handle ! from the server so that you
+//! may shut it down gracefully.
 //!
 //! ```no_run
 //! use linebased::Server;
 //! use std::thread;
 //!
-//! let mut server = Server::new(Default::default(), |query| {
-//!     match query {
-//!         "version" => String::from("0.1.0"),
-//!         _ => String::from("unknown command"),
-//!     }
-//! }).unwrap();
+//! #[tokio::main]
+//! async fn main() {
+//!     let mut server = Server::new(Default::default(), |query| {
+//!         match query {
+//!             "version" => String::from("0.1.0"),
+//!             _ => String::from("unknown command"),
+//!         }
+//!     }).unwrap();
 //!
-//! let handle = server.handle();
-//! let thread = thread::spawn(move || server.run().unwrap());
+//!     let handle = server.handle();
+//!     let fut = tokio::spawn(async move { server.run().await });
 //!
-//! // Time passes
+//!     // Time passes
 //!
-//! handle.shutdown().unwrap();
-//! thread.join().unwrap();
+//!     handle.shutdown();
+//!     fut.await.expect("failed to spawn future").expect("Error from linebased::Server::run");
+//! }
 //! ```
 #![warn(missing_docs)]
-extern crate mio;
-#[macro_use]
-extern crate log;
 
-use std::str;
 use std::io;
+use std::net::{Shutdown, SocketAddr};
+use std::str;
+use std::sync::Arc;
 
-use mio::{EventLoop, Token, EventSet, PollOpt};
-use mio::tcp::TcpListener;
-use mio::tcp::TcpStream;
-use mio::util::Slab;
-use mio::TryRead;
-use mio::TryWrite;
+use futures::prelude::*;
+use log::{error, info, warn};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{
+    broadcast::{self, Receiver, Sender},
+    Semaphore,
+};
 
 mod error;
 
-pub use error::Result;
 pub use error::Error;
+pub use error::Result;
 
-const NEWLINE: u8 = 0x0a;
-const SERVER_TOKEN: Token = Token(0);
-
-/// Possible states a client is in
-enum ClientState {
-    /// Waiting for command from client
-    Await,
-
-    /// Writing response to client
-    Responding(io::Cursor<Vec<u8>>),
-}
-
-impl Default for ClientState {
-    fn default() -> ClientState {
-        ClientState::Await
-    }
-}
-
-struct Client {
-    /// Client's token for event loop
-    token: Token,
-
-    /// The client's connection
-    socket: TcpStream,
-
-    /// Current client state
-    state: ClientState,
-
-    /// Bytes read from the stream are buffered here until a complete message is
-    /// received.
-    buf: Vec<u8>,
-
-    /// Buffer position
-    pos: usize,
-}
-
-enum Status {
-    Ok,
-    Disconnected,
-}
-
-impl Client {
-    pub fn new(stream: TcpStream, token: Token, config: &Config) -> Client {
-        Client {
-            token: token,
-            socket: stream,
-            state: ClientState::Await,
-            buf: vec![0u8; config.client_buf_size],
-            pos: 0,
-        }
-    }
-
-    pub fn interest(&self) -> EventSet {
-        match self.state {
-            ClientState::Await => EventSet::readable(),
-            ClientState::Responding(_) => EventSet::writable(),
-        }
-    }
-
-    #[inline]
-    pub fn reregister(&mut self, event_loop: &mut EventLoop<ServerInner>) -> io::Result<()> {
-        let opt = PollOpt::edge() | PollOpt::oneshot();
-        event_loop.reregister(&self.socket, self.token, self.interest(), opt)
-    }
-
-    pub fn write(&mut self, _event_loop: &mut EventLoop<ServerInner>) -> Status {
-        let mut done = false;
-        match self.state {
-            ClientState::Responding(ref mut buf) => {
-                match self.socket.try_write_buf(buf) {
-                    Ok(_) => {
-                        // Done writing if the cursor position is at end of buf
-                        if buf.get_ref().len() as u64 == buf.position() {
-                            // Transition to base state. We use the done flag since state is
-                            // currently borrowed.
-                            done = true;
-                        }
-                    },
-                    Err(err) => {
-                        debug!("error writing to client; disconnecting. {}", err);
-                        return Status::Disconnected
-                    }
-                }
-            },
-            _ => ()
-        }
-
-        if done {
-            // Reset state
-            self.state = ClientState::Await;
-        }
-
-        Status::Ok
-    }
-
-    pub fn consume(&mut self, count: usize) {
-        // Optimize for consuming entire contents
-        if count == self.pos {
-            self.pos = 0;
-            return;
-        }
-
-        // Move extra bytes to front
-        unsafe {
-            ::std::ptr::copy(self.buf[count..self.pos].as_ptr(),
-                             self.buf.as_mut_ptr(),
-                             count);
-        }
-
-        self.pos -= count;
-    }
-
-    pub fn try_respond<F>(&mut self, func: &F)
-        where F: Fn(&str) -> String
-    {
-        let mut response_buf = Vec::new();
-
-        loop {
-            // Got some bytes. Check if there's a newline in the new
-            // output.  If there is, process it.
-            if let Some(pos) = find_in_slice(&self.buf[..self.pos], NEWLINE) {
-                {
-                    // The command is all of the bytes in the buffer
-                    // leading up to the newline.
-                    let command = &self.buf[..pos];
-
-                    match str::from_utf8(command) {
-                        Ok(command) => {
-                            let response = func(command);
-                            response_buf.extend_from_slice(response.as_bytes());
-                            response_buf.push(NEWLINE);
-                        },
-                        Err(_) => debug!("command is invalid utf8"),
-                    }
-                }
-
-                // Move leftover bytes to front of buffer and update pos
-                // XXX off-by-1 error if newline is *exactly* at end of
-                // buffer.
-                let count = pos + 1;
-                self.consume(count);
-            } else {
-                break;
-            }
-        }
-
-        if !response_buf.is_empty() {
-            self.state = ClientState::Responding(io::Cursor::new(response_buf));
-        }
-    }
-
-    pub fn read<F>(&mut self,
-                   _event_loop: &mut EventLoop<ServerInner>,
-                   func: &F)
-                   -> Status
-        where F: Fn(&str) -> String
-    {
-        match self.socket.try_read(&mut self.buf[self.pos..]) {
-            Ok(Some(0)) => {
-                trace!("read zero bytes; disconnecting client");
-                return Status::Disconnected;
-            },
-            Ok(Some(bytes_read)) => {
-                self.pos += bytes_read;
-
-                self.try_respond(func);
-
-                // Handle full buffer; just try and handle the command
-                if self.pos == self.buf.len() {
-                    match str::from_utf8(&self.buf[..]) {
-                        Ok(command) => {
-                            let response = func(command);
-                            let mut response = response.into_bytes();
-                            response.push(NEWLINE);
-                            self.state = ClientState::Responding(io::Cursor::new(response));
-                        },
-                        Err(_) => debug!("command is invalid utf8"),
-                    }
-
-                    let count = self.pos;
-                    self.consume(count);
-
-                    return Status::Ok;
-                }
-
-                Status::Ok
-            },
-            Ok(None) => {
-                Status::Ok
-            },
-            Err(err) => {
-                debug!("error reading from client; disconnecting: {}", err);
-                return Status::Disconnected
-            }
-        }
-
-    }
-}
-
-/// Find first occurrence of `target` in `slice`
-fn find_in_slice<T: PartialEq>(slice: &[T], target: T) -> Option<usize> {
-    for (index, item) in slice.iter().enumerate() {
-        if item == &target {
-            return Some(index);
-        }
-    }
-
-    None
-}
+type HandleFn = Arc<dyn Fn(&str) -> String + 'static + Send + Sync>;
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -284,16 +85,15 @@ pub struct Config {
     /// Maximum number of client connections
     max_clients: usize,
 
-    /// Per client buffer size.
-    ///
-    /// This dictates the maximum length of a command.
+    /// initial per-client buffer size, will grow beyond this limit if required.
     client_buf_size: usize,
 }
 
 impl Config {
     /// Set host address to listen on
     pub fn host<S>(mut self, val: S) -> Self
-        where S: Into<String>
+    where
+        S: Into<String>,
     {
         self.host = val.into();
         self
@@ -311,7 +111,7 @@ impl Config {
         self
     }
 
-    /// Set the per-client buffer size
+    /// Set the initial per-client buffer size, will grow beyond this limit if required.
     pub fn client_buf_size(mut self, val: usize) -> Self {
         self.client_buf_size = val;
         self
@@ -329,30 +129,134 @@ impl Default for Config {
     }
 }
 
-/// Handle for the server
-pub struct Handle {
-    sender: mio::Sender<ControlMsg>,
+struct Client {
+    buf: String,
+    reader: BufReader<ReadHalf<TcpStream>>,
+    writer: WriteHalf<TcpStream>,
+    handle_fn: HandleFn,
 }
 
-impl Handle {
-    /// Request the server to shutdown gracefully
-    pub fn shutdown(&self) -> io::Result<()> {
-        while let Err(err) = self.sender.send(ControlMsg::Shutdown) {
-            match err {
-                mio::NotifyError::Full(_) => continue,
-                mio::NotifyError::Closed(_) => break,
-                mio::NotifyError::Io(err) => return Err(err),
+impl Client {
+    fn new(config: &Config, stream: TcpStream, handle_fn: &HandleFn) -> Client {
+        let (reader, writer) = tokio::io::split(stream);
+
+        let buf = String::with_capacity(config.client_buf_size);
+        let reader = BufReader::with_capacity(config.client_buf_size, reader);
+        let handle_fn = Arc::clone(handle_fn);
+
+        Client {
+            buf,
+            reader,
+            writer,
+            handle_fn,
+        }
+    }
+
+    fn spawn(self, clients: &Arc<Semaphore>, shutdown_send: &Sender<ControlMsg>) {
+        let clients = Arc::clone(&clients);
+        let shutdown_recv = shutdown_send.subscribe();
+
+        tokio::spawn(self.try_accept(clients, shutdown_recv));
+    }
+
+    async fn try_accept(self, clients: Arc<Semaphore>, shutdown_recv: Receiver<ControlMsg>) {
+        let permit = match clients.try_acquire() {
+            Ok(client) => client,
+            Err(_) => {
+                warn!("rejecting client; max connections reached");
+                return;
+            }
+        };
+
+        self.accept(shutdown_recv).await;
+
+        drop(permit);
+    }
+
+    async fn accept(mut self, mut shutdown_recv: Receiver<ControlMsg>) {
+        let mut got_error = false;
+
+        loop {
+            futures::select! {
+                result = self.handle_line().fuse() => {
+                    if let Err(e) = result {
+                        error!("Error handling value: {}", e);
+                        got_error = true;
+                        break;
+                    }
+
+                    self.buf.clear();
+                }
+                control_msg = shutdown_recv.recv().fuse() => {
+                    match control_msg {
+                        Ok(ControlMsg::Shutdown) => {
+                            info!("Shutting down server");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error receiving control message {:?}", e);
+                            break;
+                        }
+                    }
+                }
             }
         }
+
+        if !got_error {
+            self.shutdown();
+        }
+    }
+
+    fn shutdown(self) {
+        if let Err(e) = self
+            .reader
+            .into_inner()
+            .unsplit(self.writer)
+            .shutdown(Shutdown::Both)
+        {
+            error!("Error closing socket connection {:?}", e);
+        }
+    }
+
+    async fn handle_line(&mut self) -> Result<()> {
+        self.reader.read_line(&mut self.buf).await?;
+
+        // Remove the newline at the end of the string
+        let slice = &self.buf[0..self.buf.len() - 1];
+
+        let handle_fn = &self.handle_fn;
+        let mut response = handle_fn(&slice);
+        response.push('\n');
+
+        self.writer.write_all(response.as_bytes()).await?;
 
         Ok(())
     }
 }
 
+/// Handle for the server
+pub struct Handle {
+    sender: Sender<ControlMsg>,
+}
+
+impl Handle {
+    /// Request the server to shutdown gracefully
+    pub fn shutdown(self) {
+        // send only returns an error if there are no receivers active, meaning
+        // the server was already shut down, so it is safe to ignore this
+        // result.
+        let _ = self.sender.send(ControlMsg::Shutdown);
+    }
+}
+
 /// The linebased TCP server
 pub struct Server {
-    inner: ServerInner,
-    event_loop: EventLoop<ServerInner>,
+    handler: HandleFn,
+    config: Config,
+    address: SocketAddr,
+    shutdown_recv: Receiver<ControlMsg>,
+    shutdown_send: Sender<ControlMsg>,
+    clients: Arc<Semaphore>,
 }
 
 impl Server {
@@ -376,168 +280,87 @@ impl Server {
     /// }).unwrap();
     /// ```
     pub fn new<F>(config: Config, func: F) -> Result<Server>
-        where F: Fn(&str) -> String + 'static + Send
+    where
+        F: Fn(&str) -> String + 'static + Send + Sync,
     {
-        let inner = try!(ServerInner::new(config, func));
-        let event_loop = try!(EventLoop::new());
+        let address = format!("{host}:{port}", host = config.host, port = config.port).parse()?;
+        let (shutdown_send, shutdown_recv) = broadcast::channel(1);
+        let clients = Arc::new(Semaphore::new(config.max_clients));
 
         Ok(Server {
-            inner: inner,
-            event_loop: event_loop
+            handler: Arc::new(func),
+            config,
+            address,
+            shutdown_send,
+            shutdown_recv,
+            clients,
         })
     }
 
     /// Get a handle for the server so graceful shutdown can be requested
     pub fn handle(&self) -> Handle {
         Handle {
-            sender: self.event_loop.channel()
+            sender: self.shutdown_send.clone(),
         }
     }
 
     /// Run the event loop
-    ///
-    /// Blocks until a graceful shutdown is initiated or an unrecoverable error
-    /// occurs.
-    pub fn run(&mut self) -> io::Result<()> {
-        let event_loop = &mut self.event_loop;
-        let server = &mut self.inner;
+    pub async fn run(&mut self) -> io::Result<()> {
+        info!("Listening at {}", self.address);
+        let mut listener = TcpListener::bind(self.address).await?;
 
-        try!(event_loop.register(&server.server,
-                                 SERVER_TOKEN,
-                                 EventSet::readable() | EventSet::hup(),
-                                 PollOpt::level()));
-        try!(event_loop.run(server));
+        loop {
+            futures::select! {
+                accept = listener.accept().fuse() => {
+                    let (socket, _) = match accept {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            error!("Error accepting connection: {}", e);
+                            continue;
+                        }
+                    };
+
+                    self.accept(socket);
+                }
+                control_msg = self.shutdown_recv.recv().fuse() => {
+                    match control_msg {
+                        Ok(ControlMsg::Shutdown) => {
+                            info!("Shutting down server");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error receiving control message {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
-}
 
-/// mio::Handler implementation
-///
-/// Can't implement mio::Handler for `Server` itself since that holds the
-/// `EventLoop`.
-struct ServerInner {
-    server: TcpListener,
-    clients: Slab<Client>,
-    handler: Box<Fn(&str) -> String + Send>,
-    config: Config,
-}
+    fn accept(&self, socket: TcpStream) {
+        let client = Client::new(&self.config, socket, &self.handler);
 
-impl ServerInner {
-    /// Create new ServerInner
-    pub fn new<F>(config: Config, func: F) -> Result<ServerInner>
-        where F: Fn(&str) -> String + 'static + Send
-    {
-        let address = try!(format!("{host}:{port}", host=config.host, port=config.port).parse());
-        let server = try!(TcpListener::bind(&address));
-
-        let slab = Slab::new_starting_at(mio::Token(1), config.max_clients);
-
-        Ok(ServerInner {
-            server: server,
-            clients: slab,
-            handler: Box::new(func),
-            config: config,
-        })
+        client.spawn(&self.clients, &self.shutdown_send);
     }
 }
 
 #[doc(hidden)]
+#[derive(Debug, Clone)]
 pub enum ControlMsg {
-    /// Stop the event loop
+    /// Stop the server and end all connections immediately
     Shutdown,
-}
-
-/// Accepts a client connection
-///
-/// This exists to work around borrowck at the call site.
-#[inline]
-fn accept(clients: &mut Slab<Client>, config: &Config, socket: TcpStream) -> Option<Token> {
-    clients.insert_with(|token| Client::new(socket, token, config))
-}
-
-impl mio::Handler for ServerInner {
-    type Timeout = ();
-    type Message = ControlMsg;
-
-    fn ready(&mut self, event_loop: &mut EventLoop<ServerInner>, token: Token, events: EventSet) {
-        match token {
-            SERVER_TOKEN => {
-                debug!("accepting connection");
-                match self.server.accept() {
-                    Ok(Some((socket, _addr))) => {
-                        let token = match accept(&mut self.clients, &self.config, socket) {
-                            Some(token) => token,
-                            None => {
-                                info!("rejecting client; max connections reached");
-                                return;
-                            }
-                        };
-
-                        let opt = PollOpt::edge() | PollOpt::oneshot();
-                        if let Err(err) = event_loop.register(&self.clients[token].socket,
-                                                              token,
-                                                              self.clients[token].interest(),
-                                                              opt)
-                        {
-                            warn!("Couldn't register new client; {}", err);
-                            self.clients.remove(token);
-                        }
-                    },
-                    Ok(None) => {
-                        // pass
-                    },
-                    Err(err) => {
-                        error!("listener.accept() error; {}", err);
-                        event_loop.shutdown();
-                    },
-                }
-            }
-
-            // Client token
-            _ => {
-                let status = {
-                    let client = &mut self.clients[token];
-                    if events.is_readable() {
-                        client.read(event_loop, &&*self.handler)
-                    } else if events.is_writable() {
-                        client.write(event_loop)
-                    } else if events.is_hup() {
-                        Status::Disconnected
-                    } else {
-                        Status::Ok
-                    }
-                };
-
-                match status {
-                    Status::Disconnected => {
-                        trace!("closing client connection");
-                        self.clients.remove(token);
-                    },
-                    Status::Ok => {
-                        if let Err(err) = self.clients[token].reregister(event_loop) {
-                            warn!("Failed to reregister client interest; {}", err);
-                            self.clients.remove(token);
-                        }
-                    },
-                }
-            },
-        }
-    }
-
-    fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: ControlMsg) {
-        match msg {
-            ControlMsg::Shutdown => event_loop.shutdown(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpStream;
-    use std::thread;
+    use std::net::SocketAddr;
+    use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+    use tokio::net::TcpStream;
 
-    use super::{Config, Server, find_in_slice, NEWLINE, Handle};
+    use super::{Config, Handle, Server};
 
     trait AsByteSlice {
         fn as_byte_slice(&self) -> &[u8];
@@ -557,9 +380,8 @@ mod tests {
 
     /// Client for testing
     struct Client {
-        stream: TcpStream,
-        buf: Vec<u8>,
-        pos: usize,
+        stream_read: BufReader<ReadHalf<TcpStream>>,
+        stream_write: WriteHalf<TcpStream>,
     }
 
     impl Client {
@@ -568,13 +390,15 @@ mod tests {
         /// Any errors will panic since this is for testing only. The server is
         /// assumed to be on the default port. Performance is not a
         /// consideration here; only ergonomics, correctness, and failing early.
-        pub fn new(config: &Config) -> Client {
-            let stream = Client::connect(config);
+        pub async fn new(config: &Config) -> Self {
+            let stream = Client::connect(config).await;
 
-            Client {
-                stream: stream,
-                buf: vec![0u8; 2048],
-                pos: 0,
+            let (stream_read, stream_write) = io::split(stream);
+            let stream_read = BufReader::new(stream_read);
+
+            Self {
+                stream_read,
+                stream_write,
             }
         }
 
@@ -582,92 +406,76 @@ mod tests {
         ///
         /// Retries as long as error is connection refused. I guess this can
         /// mean tests hang if something is wrong. Oh well.
-        fn connect(config: &Config) -> TcpStream {
+        async fn connect(config: &Config) -> TcpStream {
             loop {
-                match TcpStream::connect(format!("{}:{}", config.host, config.port).as_str()) {
+                match TcpStream::connect(
+                    format!("{}:{}", config.host, config.port)
+                        .parse::<SocketAddr>()
+                        .unwrap(),
+                )
+                .await
+                {
                     Ok(stream) => return stream,
-                    Err(err) => {
-                        match err.kind() {
-                            ::std::io::ErrorKind::ConnectionRefused => continue,
-                            _ => panic!("failed to connect; {}", err),
-                        }
-                    }
+                    Err(err) => match err.kind() {
+                        ::std::io::ErrorKind::ConnectionRefused => continue,
+                        _ => panic!("failed to connect; {}", err),
+                    },
                 }
             }
         }
 
         /// Sends all bytes to the remote
-        pub fn send<B>(&mut self, bytes: B)
-            where B: AsByteSlice
+        pub async fn send<B>(&mut self, bytes: B)
+        where
+            B: AsByteSlice,
         {
-            use ::std::io::Write;
-            self.stream.write_all(bytes.as_byte_slice()).expect("successfully send bytes");
-            self.stream.write_all(b"\n").expect("successfully send bytes");
+            self.stream_write
+                .write_all(bytes.as_byte_slice())
+                .await
+                .expect("successfully send bytes");
+            self.stream_write
+                .write_all(b"\n")
+                .await
+                .expect("successfully send bytes");
         }
 
         /// Receive the next line.
         ///
         /// Extra data is buffered internally.
-        pub fn recv(&mut self) -> Option<String> {
-            use ::std::io::Read;
+        pub async fn recv(&mut self) -> String {
+            let mut buf = String::new();
+            self.stream_read
+                .read_line(&mut buf)
+                .await
+                .expect("read_line");
 
-            // Return next line if it's already buffered
-            if let Some(s) = self.string_from_buf() {
-                return Some(s);
-            }
-
-            let got = self.stream.read(&mut self.buf[self.pos..]).expect("read gets bytes");
-            assert!(got != 0);
-
-            self.pos += got;
-
-            self.string_from_buf()
+            buf.trim_end().into()
         }
 
-        pub fn string_from_buf(&mut self) -> Option<String> {
-            if let Some(pos) = find_in_slice(&self.buf[..self.pos], NEWLINE) {
-                let s = ::std::str::from_utf8(&self.buf[..pos]).expect("valid utf8").to_owned();
-
-                // Consume bytes
-                let consume = pos + 1;
-                self.buf.drain(..consume);
-                self.pos -= consume;
-
-                Some(s)
-            } else {
-                None
-            }
-        }
-
-        pub fn expect(&mut self, s: &str) {
-            let got = self.recv().unwrap();
+        pub async fn expect(&mut self, s: &str) {
+            let got = self.recv().await;
             assert_eq!(got.as_str(), s);
         }
     }
 
     fn run_server(config: &Config) -> TestHandle {
+        let _ = env_logger::try_init();
         let config = config.to_owned();
 
-        let mut server = Server::new(config, |query| {
-            match query {
-                "version" => {
-                    String::from("0.1.0")
-                },
-                _ => {
-                    String::from("unknown command")
-                }
-            }
-        }).unwrap();
+        let mut server = Server::new(config, |query| match query {
+            "version" => String::from("0.1.0"),
+            _ => String::from("unknown command"),
+        })
+        .unwrap();
 
-        let command_handle = server.handle();
+        let handle = server.handle();
 
-        let thread_handle = ::std::thread::spawn(move || {
-            server.run().unwrap();
+        tokio::spawn(async move {
+            server.run().await.unwrap();
         });
 
         TestHandle {
-            thread: Some(thread_handle),
-            handle: command_handle,
+            handle: Some(handle),
         }
     }
 
@@ -675,93 +483,72 @@ mod tests {
     ///
     /// Requests graceful shutdown and joins with thread on drop
     pub struct TestHandle {
-        thread: Option<thread::JoinHandle<()>>,
-        handle: Handle,
+        handle: Option<Handle>,
     }
 
     impl Drop for TestHandle {
         fn drop(&mut self) {
-            let _ = self.handle.shutdown();
-            if let Some(handle) = self.thread.take() {
-                handle.join().unwrap();
-            }
+            let _ = self.handle.take().unwrap().shutdown();
         }
     }
 
-
-    #[test]
-    fn it_works() {
+    #[tokio::test]
+    async fn it_works() {
         let config = Config::default();
         let _server = run_server(&config);
 
         {
-            let mut client = Client::new(&config);
-            client.send("version");
-            client.expect("0.1.0");
-            client.send("nope");
-            client.expect("unknown command");
+            let mut client = Client::new(&config).await;
+            client.send("version").await;
+            client.expect("0.1.0").await;
+            client.send("nope").await;
+            client.expect("unknown command").await;
         }
     }
 
-    #[test]
-    fn client_message_larger_than_read_buf() {
-        let config = Config::default().client_buf_size(8).port(5500);
-        let _server = run_server(&config);
-
-        {
-            let mut client = Client::new(&config);
-            client.send("123456789"); // send more than buf size of 8
-            client.expect("unknown command"); // first 8 bytes trigger this response
-            client.expect("unknown command"); // "9\n" triggers this response
-            // commands should continue to work
-            client.send("version");
-            client.expect("0.1.0");
-        }
-    }
-
-    #[test]
-    fn send_empty_line() {
+    #[tokio::test]
+    async fn send_empty_line() {
         let config = Config::default().port(5501);
         let _server = run_server(&config);
 
         {
-            let mut client = Client::new(&config);
-            client.send("");
-            client.expect("unknown command");
+            let mut client = Client::new(&config).await;
+            client.send("").await;
+            client.expect("unknown command").await;
             // commands should continue to work
-            client.send("version");
-            client.expect("0.1.0");
+            client.send("version").await;
+            client.expect("0.1.0").await;
         }
     }
 
-    #[test]
-    fn multiple_commands_received_at_once() {
+    #[tokio::test]
+    async fn multiple_commands_received_at_once() {
         let config = Config::default().port(5502);
         let _server = run_server(&config);
 
         {
-            let mut client = Client::new(&config);
-            client.send("version\nversion");
+            let mut client = Client::new(&config).await;
+            client.send("version\nversion").await;
 
             // This is a bug. Second response may or may not have a prompt.
-            let got = client.recv().unwrap();
+            let got = client.recv().await;
             assert!(got.contains("0.1.0"));
         }
     }
 
-    #[test]
-    fn exceed_max_clients() {
+    #[tokio::test]
+    async fn exceed_max_clients() {
         let config = Config::default().max_clients(1).port(5503);
         let _server = run_server(&config);
 
         {
-            let mut client = Client::new(&config);
+            let mut client = Client::new(&config).await;
             {
                 // should get disconnected immediately
-                let _client = Client::new(&config);
+                let _client = Client::new(&config).await;
             }
-            client.send("version");
-            client.expect("0.1.0");
+            client.send("version").await;
+            client.expect("0.1.0").await;
         }
     }
 }
