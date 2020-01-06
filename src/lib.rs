@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Drop-in TCP command server
 //!
 //! Provide a callback that is passed commands from clients and handle them synchronously.
@@ -60,12 +61,17 @@ use futures::prelude::*;
 use log::{error, info, warn};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast::{self, Receiver, Sender};
+use tokio::sync::{
+    broadcast::{self, Receiver, Sender},
+    Semaphore,
+};
 
 mod error;
 
 pub use error::Error;
 pub use error::Result;
+
+type HandleFn = Arc<dyn Fn(&str) -> String + 'static + Send + Sync>;
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -79,9 +85,7 @@ pub struct Config {
     /// Maximum number of client connections
     max_clients: usize,
 
-    /// Per client buffer size.
-    ///
-    /// This dictates the maximum length of a command.
+    /// initial per-client buffer size, will grow beyond this limit if required.
     client_buf_size: usize,
 }
 
@@ -107,7 +111,7 @@ impl Config {
         self
     }
 
-    /// Set the per-client buffer size, will grow beyond this limit if required.
+    /// Set the initial per-client buffer size, will grow beyond this limit if required.
     pub fn client_buf_size(mut self, val: usize) -> Self {
         self.client_buf_size = val;
         self
@@ -122,6 +126,111 @@ impl Default for Config {
             max_clients: 32,
             client_buf_size: 1024,
         }
+    }
+}
+
+struct Client {
+    buf: String,
+    reader: BufReader<ReadHalf<TcpStream>>,
+    writer: WriteHalf<TcpStream>,
+    handle_fn: HandleFn,
+}
+
+impl Client {
+    fn new(config: &Config, stream: TcpStream, handle_fn: &HandleFn) -> Client {
+        let (reader, writer) = tokio::io::split(stream);
+
+        let buf = String::with_capacity(config.client_buf_size);
+        let reader = BufReader::with_capacity(config.client_buf_size, reader);
+        let handle_fn = Arc::clone(handle_fn);
+
+        Client {
+            buf,
+            reader,
+            writer,
+            handle_fn,
+        }
+    }
+
+    fn spawn(self, clients: &Arc<Semaphore>, shutdown_send: &Sender<ControlMsg>) {
+        let clients = Arc::clone(&clients);
+        let shutdown_recv = shutdown_send.subscribe();
+
+        tokio::spawn(self.try_accept(clients, shutdown_recv));
+    }
+
+    async fn try_accept(self, clients: Arc<Semaphore>, shutdown_recv: Receiver<ControlMsg>) {
+        let permit = match clients.try_acquire() {
+            Ok(client) => client,
+            Err(_) => {
+                warn!("rejecting client; max connections reached");
+                return;
+            }
+        };
+
+        self.accept(shutdown_recv).await;
+
+        drop(permit);
+    }
+
+    async fn accept(mut self, mut shutdown_recv: Receiver<ControlMsg>) {
+        let mut got_error = false;
+
+        loop {
+            futures::select! {
+                result = self.handle_line().fuse() => {
+                    if let Err(e) = result {
+                        error!("Error handling value: {}", e);
+                        got_error = true;
+                        break;
+                    }
+
+                    self.buf.clear();
+                }
+                control_msg = shutdown_recv.recv().fuse() => {
+                    match control_msg {
+                        Ok(ControlMsg::Shutdown) => {
+                            info!("Shutting down server");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Error receiving control message {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !got_error {
+            self.shutdown();
+        }
+    }
+
+    fn shutdown(self) {
+        if let Err(e) = self
+            .reader
+            .into_inner()
+            .unsplit(self.writer)
+            .shutdown(Shutdown::Both)
+        {
+            error!("Error closing socket connection {:?}", e);
+        }
+    }
+
+    async fn handle_line(&mut self) -> Result<()> {
+        self.reader.read_line(&mut self.buf).await?;
+
+        // Remove the newline at the end of the string
+        let slice = &self.buf[0..self.buf.len() - 1];
+
+        let handle_fn = &self.handle_fn;
+        let mut response = handle_fn(&slice);
+        response.push('\n');
+
+        self.writer.write_all(response.as_bytes()).await?;
+
+        Ok(())
     }
 }
 
@@ -142,11 +251,12 @@ impl Handle {
 
 /// The linebased TCP server
 pub struct Server {
-    handler: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    handler: HandleFn,
     config: Config,
     address: SocketAddr,
     shutdown_recv: Receiver<ControlMsg>,
     shutdown_send: Sender<ControlMsg>,
+    clients: Arc<Semaphore>,
 }
 
 impl Server {
@@ -175,6 +285,7 @@ impl Server {
     {
         let address = format!("{host}:{port}", host = config.host, port = config.port).parse()?;
         let (shutdown_send, shutdown_recv) = broadcast::channel(1);
+        let clients = Arc::new(Semaphore::new(config.max_clients));
 
         Ok(Server {
             handler: Arc::new(func),
@@ -182,6 +293,7 @@ impl Server {
             address,
             shutdown_send,
             shutdown_recv,
+            clients,
         })
     }
 
@@ -200,7 +312,13 @@ impl Server {
         loop {
             futures::select! {
                 accept = listener.accept().fuse() => {
-                    let (socket, _) = accept?;
+                    let (socket, _) = match accept {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            error!("Error accepting connection: {}", e);
+                            continue;
+                        }
+                    };
 
                     self.accept(socket);
                 }
@@ -223,82 +341,10 @@ impl Server {
     }
 
     fn accept(&self, socket: TcpStream) {
-        let (reader, writer) = tokio::io::split(socket);
+        let client = Client::new(&self.config, socket, &self.handler);
 
-        let buf = String::with_capacity(self.config.client_buf_size);
-        let reader = BufReader::with_capacity(self.config.client_buf_size, reader);
-        let handle_fn = Arc::clone(&self.handler);
-        let shutdown_recv = self.shutdown_send.subscribe();
-
-        tokio::spawn(async move {
-            Server::spawn_accept(buf, reader, writer, handle_fn, shutdown_recv).await;
-        });
+        client.spawn(&self.clients, &self.shutdown_send);
     }
-
-    async fn spawn_accept(
-        mut buf: String,
-        mut reader: BufReader<ReadHalf<TcpStream>>,
-        mut writer: WriteHalf<TcpStream>,
-        handle_fn: Arc<dyn Fn(&str) -> String + 'static + Send + Sync>,
-        mut shutdown_recv: Receiver<ControlMsg>,
-    ) {
-        let mut got_error = false;
-
-        loop {
-            futures::select! {
-                result = handler(&mut reader, &mut writer, &*handle_fn, &mut buf).fuse() => {
-                    if let Err(e) = result {
-                        error!("Error handling value: {}", e);
-                        got_error = true;
-                        break;
-                    }
-
-                    buf.clear();
-                }
-                control_msg = shutdown_recv.recv().fuse() => {
-                    match control_msg {
-                        Ok(ControlMsg::Shutdown) => {
-                            info!("Shutting down server");
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Error receiving control message {:?}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !got_error {
-            if let Err(e) = reader.into_inner().unsplit(writer).shutdown(Shutdown::Both) {
-                error!("Error closing socket connection {:?}", e);
-            }
-        }
-    }
-}
-
-async fn handler<R, W>(
-    mut reader: R,
-    mut writer: W,
-    handler: &(dyn Fn(&str) -> String + 'static + Send + Sync),
-    buf: &mut String,
-) -> Result<()>
-where
-    R: AsyncBufReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    reader.read_line(buf).await?;
-
-    // Remove the newline at the end of the string
-    let slice = &buf[0..buf.len() - 1];
-
-    let mut response = handler(&slice);
-    response.push('\n');
-
-    writer.write_all(response.as_bytes()).await?;
-
-    Ok(())
 }
 
 #[doc(hidden)]

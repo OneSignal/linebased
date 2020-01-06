@@ -9,7 +9,7 @@ async fn main() {
     let config = Config::default()
         .host("127.0.0.1")
         .port(5555)
-        .max_clients(32)
+        .max_clients(100)
         .client_buf_size(24);
 
     let mut server = Server::new(config, |query| match query {
