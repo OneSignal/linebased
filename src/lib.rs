@@ -67,8 +67,6 @@ mod error;
 pub use error::Error;
 pub use error::Result;
 
-const NEWLINE: u8 = b'\n';
-
 /// Server configuration
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -291,10 +289,14 @@ where
     W: AsyncWriteExt + Unpin,
 {
     reader.read_line(buf).await?;
+
+    // Remove the newline at the end of the string
     let slice = &buf[0..buf.len() - 1];
-    let response = handler(&slice);
+
+    let mut response = handler(&slice);
+    response.push('\n');
+
     writer.write_all(response.as_bytes()).await?;
-    writer.write_u8(NEWLINE).await?;
 
     Ok(())
 }
