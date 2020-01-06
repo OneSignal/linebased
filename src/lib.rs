@@ -221,8 +221,12 @@ impl Client {
     async fn handle_line(&mut self) -> Result<()> {
         self.reader.read_line(&mut self.buf).await?;
 
-        // Remove the newline at the end of the string
-        let slice = &self.buf[0..self.buf.len() - 1];
+        let slice = if self.buf.is_empty() {
+            &self.buf[..]
+        } else {
+            // Remove the newline at the end of the string
+            &self.buf[0..self.buf.len() - 1]
+        };
 
         let handle_fn = &self.handle_fn;
         let mut response = handle_fn(&slice);
