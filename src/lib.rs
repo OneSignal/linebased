@@ -234,7 +234,7 @@ impl Client {
         response.push('\n');
 
         self.writer.write_all(response.as_bytes()).await?;
-        trace!("Wrote response: \"{}\"", response);
+        trace!("Wrote response: \"{}\"", response.trim());
 
         Ok(())
     }
