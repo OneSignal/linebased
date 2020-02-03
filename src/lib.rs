@@ -58,7 +58,7 @@ use std::str;
 use std::sync::Arc;
 
 use futures::prelude::*;
-use log::{error, info, warn};
+use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{
@@ -168,20 +168,18 @@ impl Client {
             }
         };
 
+        trace!("accept client connection");
         self.accept(shutdown_recv).await;
 
         drop(permit);
     }
 
     async fn accept(mut self, mut shutdown_recv: Receiver<ControlMsg>) {
-        let mut got_error = false;
-
         loop {
             futures::select! {
                 result = self.handle_line().fuse() => {
                     if let Err(e) = result {
-                        error!("Error handling value: {}", e);
-                        got_error = true;
+                        debug!("Error handling value - shutting down connection: {}", e);
                         break;
                     }
 
@@ -202,9 +200,7 @@ impl Client {
             }
         }
 
-        if !got_error {
-            self.shutdown();
-        }
+        self.shutdown();
     }
 
     fn shutdown(self) {
@@ -214,12 +210,15 @@ impl Client {
             .unsplit(self.writer)
             .shutdown(Shutdown::Both)
         {
-            error!("Error closing socket connection {:?}", e);
+            debug!("Error closing socket connection {:?}", e);
         }
     }
 
     async fn handle_line(&mut self) -> Result<()> {
-        self.reader.read_line(&mut self.buf).await?;
+        let bytes_read = self.reader.read_line(&mut self.buf).await?;
+        if bytes_read == 0 {
+            return Err(Error::NoBytesRead);
+        }
 
         let slice = if self.buf.is_empty() {
             &self.buf[..]
@@ -228,11 +227,14 @@ impl Client {
             &self.buf[0..self.buf.len() - 1]
         };
 
+        trace!("Read line: \"{}\"", slice);
+
         let handle_fn = &self.handle_fn;
         let mut response = handle_fn(&slice);
         response.push('\n');
 
         self.writer.write_all(response.as_bytes()).await?;
+        trace!("Wrote response: \"{}\"", response);
 
         Ok(())
     }

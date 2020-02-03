@@ -1,5 +1,4 @@
-use std::io;
-use std::net;
+use std::{error, fmt, io, net};
 
 /// Error from linebased crate
 #[derive(Debug)]
@@ -9,29 +8,27 @@ pub enum Error {
 
     /// Error parsing listen address
     AddrParse(net::AddrParseError),
+
+    /// No bytes were read from the stream
+    NoBytesRead,
 }
 
-impl ::std::error::Error for Error {
-    fn cause(&self) -> Option<&dyn std::error::Error> {
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn 'static + std::error::Error)> {
         match *self {
             Error::Io(ref err) => Some(err),
             Error::AddrParse(ref err) => Some(err),
-        }
-    }
-
-    fn description(&self) -> &str {
-        match *self {
-            Error::Io(ref err) => err.description(),
-            Error::AddrParse(ref err) => err.description(),
+            Error::NoBytesRead => None,
         }
     }
 }
 
-impl ::std::fmt::Display for Error {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Error::Io(ref err) => write!(f, "Linebased Server Error: {}", err),
-            Error::AddrParse(ref err) => write!(f, "Linebased Server Error: {}", err),
+            Error::AddrParse(ref err) => write!(f, "Error parsing address: {}", err),
+            Error::NoBytesRead => write!(f, "No bytes read from stream"),
         }
     }
 }
