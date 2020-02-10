@@ -246,7 +246,7 @@ impl Client {
 
         let handle_fn = &self.handle_fn;
         let mut response = if self.handle_fn_blocks {
-            let handle_fn = Arc::clone(&self.handle_fn);
+            let handle_fn = Arc::clone(handle_fn);
             let string = slice.to_owned();
 
             tokio::task::spawn_blocking(move || handle_fn(&string)).await?
