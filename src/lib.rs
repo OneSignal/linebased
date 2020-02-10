@@ -87,6 +87,10 @@ pub struct Config {
 
     /// initial per-client buffer size, will grow beyond this limit if required.
     client_buf_size: usize,
+
+    /// If the handler function blocks, it should be spawned on its own worker
+    /// thread so that the tokio threadpool isn't blocked by it.
+    handle_fn_blocks: bool,
 }
 
 impl Config {
@@ -116,6 +120,14 @@ impl Config {
         self.client_buf_size = val;
         self
     }
+
+    /// Indicate that the handle fn might block and should be spawned on a tokio
+    /// worker thread. This should be used if the fn does heavy computation, or
+    /// has any blocking i/o in it.
+    pub fn handle_fn_blocks(mut self) -> Self {
+        self.handle_fn_blocks = true;
+        self
+    }
 }
 
 impl Default for Config {
@@ -125,6 +137,7 @@ impl Default for Config {
             port: 7343,
             max_clients: 32,
             client_buf_size: 1024,
+            handle_fn_blocks: false,
         }
     }
 }
@@ -134,6 +147,7 @@ struct Client {
     reader: BufReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
     handle_fn: HandleFn,
+    handle_fn_blocks: bool,
 }
 
 impl Client {
@@ -149,6 +163,7 @@ impl Client {
             reader,
             writer,
             handle_fn,
+            handle_fn_blocks: config.handle_fn_blocks,
         }
     }
 
@@ -230,7 +245,15 @@ impl Client {
         trace!("Read line: \"{}\"", slice);
 
         let handle_fn = &self.handle_fn;
-        let mut response = handle_fn(&slice);
+        let mut response = if self.handle_fn_blocks {
+            let handle_fn = Arc::clone(&self.handle_fn);
+            let string = slice.to_owned();
+
+            tokio::task::spawn_blocking(move || handle_fn(&string)).await?
+        } else {
+            handle_fn(&slice)
+        };
+
         response.push('\n');
 
         self.writer.write_all(response.as_bytes()).await?;
