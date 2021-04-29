@@ -53,7 +53,7 @@
 #![warn(missing_docs)]
 
 use std::io;
-use std::net::{Shutdown, SocketAddr};
+use std::net::SocketAddr;
 use std::str;
 use std::sync::Arc;
 
@@ -215,15 +215,16 @@ impl Client {
             }
         }
 
-        self.shutdown();
+        self.shutdown().await;
     }
 
-    fn shutdown(self) {
+    async fn shutdown(self) {
         if let Err(e) = self
             .reader
             .into_inner()
             .unsplit(self.writer)
-            .shutdown(Shutdown::Both)
+            .shutdown()
+            .await
         {
             debug!("Error closing socket connection {:?}", e);
         }
@@ -336,7 +337,7 @@ impl Server {
     /// Run the event loop
     pub async fn run(&mut self) -> io::Result<()> {
         info!("Listening at {}", self.address);
-        let mut listener = TcpListener::bind(self.address).await?;
+        let listener = TcpListener::bind(self.address).await?;
 
         loop {
             futures::select! {

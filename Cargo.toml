@@ -1,6 +1,6 @@
 [package]
 name = "linebased"
-version = "0.4.3"
+version = "0.5.0"
 authors = ["Joe Wilm <joe@jwilm.com>"]
 license = "MIT OR Apache-2.0"
 description = "Add a TCP query port to any program"
@@ -10,10 +10,10 @@ documentation = "http://blog.jwilm.io/linebased/linebased/index.html"
 edition = "2018"
 
 [dependencies]
-tokio = { version = "0.2", features = ["tcp", "sync", "rt-core", "io-util", "blocking"] }
+tokio = { version = "1", features = ["net", "sync", "rt", "io-util"] }
 log = "0.4"
 futures = "0.3"
 
 [dev-dependencies]
-tokio = { version = "0.2", features = ["macros", "rt-threaded"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 env_logger = "0.7"
